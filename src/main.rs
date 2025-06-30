@@ -7,6 +7,7 @@ use parquet::arrow::{arrow_reader::ParquetRecordBatchReaderBuilder, ArrowWriter}
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 use std::fs::File;
+use std::sync::Arc;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -112,6 +113,45 @@ fn consolidate_parquet_files(
         anyhow::bail!("No input files provided");
     }
     
+    // Read the first file to get the schema and validate all schemas upfront
+    let schema = get_and_validate_schema(input_files, verbose)?;
+    
+    // Create output file
+    let output_file = File::create(output_path)
+        .context(format!("Failed to create output file: {:?}", output_path))?;
+    
+    let props = WriterProperties::builder()
+        .set_compression(Compression::SNAPPY)
+        .set_write_batch_size(8192) // Optimize batch size
+        .build();
+    
+    let mut writer = ArrowWriter::try_new(output_file, schema.clone(), Some(props))?;
+    let mut total_rows = 0;
+    
+    // Process each input file
+    for (idx, input_file) in input_files.iter().enumerate() {
+        if verbose {
+            println!("Processing file {}/{}: {:?}", idx + 1, input_files.len(), input_file);
+        }
+        
+        let rows_written = process_single_file(input_file, &mut writer, verbose)?;
+        total_rows += rows_written;
+        
+        if verbose {
+            println!("  Wrote {} rows from this file", rows_written);
+        }
+    }
+    
+    writer.close()?;
+    
+    if verbose {
+        println!("Total rows written: {}", total_rows);
+    }
+    
+    Ok(())
+}
+
+fn get_and_validate_schema(input_files: &[PathBuf], verbose: bool) -> Result<Arc<Schema>> {
     // Read the first file to get the schema
     let first_file = File::open(&input_files[0])
         .context(format!("Failed to open first parquet file: {:?}", input_files[0]))?;
@@ -121,50 +161,62 @@ fn consolidate_parquet_files(
     
     if verbose {
         println!("Schema from first file: {:?}", schema);
+        println!("Validating schema compatibility across all files...");
     }
     
-    // Create output file
-    let output_file = File::create(output_path)
-        .context(format!("Failed to create output file: {:?}", output_path))?;
-    
-    let props = WriterProperties::builder()
-        .set_compression(Compression::SNAPPY) // Set your desired compression here
-        .build();
-    
-    let mut writer = ArrowWriter::try_new(output_file, schema.clone(), Some(props))?;
-    
-    // Process each input file
-    for (idx, input_file) in input_files.iter().enumerate() {
-        if verbose {
-            println!("Processing file {}/{}: {:?}", idx + 1, input_files.len(), input_file);
-        }
-        
+    // Validate all schemas upfront to fail fast if there are incompatibilities
+    for (idx, input_file) in input_files.iter().skip(1).enumerate() {
         let file = File::open(input_file)
             .context(format!("Failed to open parquet file: {:?}", input_file))?;
         
         let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
-        
-        // Verify schema compatibility
         let file_schema = builder.schema();
+        
         if !schemas_compatible(&schema, file_schema) {
             anyhow::bail!(
-                "Schema mismatch in file {:?}. Expected: {:?}, Found: {:?}",
-                input_file, schema, file_schema
+                "Schema mismatch in file {:?} (file {}/{}). Expected: {:?}, Found: {:?}",
+                input_file, idx + 2, input_files.len(), schema, file_schema
             );
-        }
-        
-        // Read and write batches
-        let reader = builder.build()?;
-        
-        for batch_result in reader {
-            let batch = batch_result?;
-            writer.write(&batch)?;
         }
     }
     
-    writer.close()?;
+    if verbose {
+        println!("All schemas are compatible!");
+    }
     
-    Ok(())
+    Ok(schema)
+}
+
+fn process_single_file(
+    input_file: &PathBuf, 
+    writer: &mut ArrowWriter<File>,
+    verbose: bool
+) -> Result<usize> {
+    let file = File::open(input_file)
+        .context(format!("Failed to open parquet file: {:?}", input_file))?;
+    
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+    let reader = builder.build()?;
+    
+    let mut rows_written = 0;
+    let mut batch_count = 0;
+    
+    for batch_result in reader {
+        let batch = batch_result
+            .context(format!("Failed to read batch from file: {:?}", input_file))?;
+        
+        rows_written += batch.num_rows();
+        batch_count += 1;
+        
+        writer.write(&batch)
+            .context(format!("Failed to write batch {} from file: {:?}", batch_count, input_file))?;
+    }
+    
+    if verbose && batch_count > 1 {
+        println!("  Processed {} batches", batch_count);
+    }
+    
+    Ok(rows_written)
 }
 
 fn schemas_compatible(schema1: &Schema, schema2: &Schema) -> bool {
