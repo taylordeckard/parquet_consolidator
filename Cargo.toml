@@ -3,6 +3,10 @@ name = "parquet_consolidator"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "parquet_consolidator"
+path = "src/lib.rs"
+
 [[bin]]
 name = "parquet_consolidator"
 path = "src/main.rs"
@@ -11,10 +15,21 @@ path = "src/main.rs"
 name = "test_data_generator"
 path = "src/test_data_generator.rs"
 
+[[bin]]
+name = "test_runner"
+path = "src/test_runner.rs"
+
 [dependencies]
 clap = { version = "4.0", features = ["derive"] }
 arrow = "53.0"
 parquet = "53.0"
+polars = { version = "0.32", features = ["lazy", "parquet"]  }
 tokio = { version = "1.0", features = ["full"] }
 anyhow = "1.0"
 walkdir = "2.3"
+
+[dev-dependencies]
+tempfile = "3.0"
+assert_cmd = "2.0"
+predicates = "3.0"
+proptest = "1.0"
